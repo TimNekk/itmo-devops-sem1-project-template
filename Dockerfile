@@ -7,7 +7,7 @@ RUN go mod download && go mod verify
 
 COPY *.go ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /main main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o /main .
 
 FROM gcr.io/distroless/base-debian11
 
