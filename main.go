@@ -1,14 +1,17 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -94,8 +97,7 @@ func uploadPrices(c *gin.Context) {
 	}
 	defer file.Close()
 
-	data := make([]byte, fileHeader.Size)
-	_, err = file.Read(data)
+	data, err := io.ReadAll(file)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to read file"})
 		return
@@ -106,31 +108,98 @@ func uploadPrices(c *gin.Context) {
 	seenIDs := make(map[int]bool)
 	categories := make(map[string]bool)
 
-	zipReader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to create zip reader"})
-		return
+	// Parse all CSV files from archive
+	var recordsToInsert []map[string]string
+	var csvFiles []struct {
+		name    string
+		content []byte
 	}
 
-	// Parse all CSV files
-	var recordsToInsert []map[string]string
-	for _, file := range zipReader.File {
-		rc, err := file.Open()
+	if archiveType == "tar" {
+		// Handle TAR archive
+		tarReader := tar.NewReader(bytes.NewReader(data))
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to read tar archive"})
+				return
+			}
+
+			if header.Typeflag != tar.TypeReg {
+				continue
+			}
+
+			// Skip macOS resource fork files
+			fileName := filepath.Base(header.Name)
+			if strings.HasPrefix(fileName, "._") {
+				continue
+			}
+
+			if !strings.HasSuffix(strings.ToLower(header.Name), ".csv") {
+				continue
+			}
+
+			// Read file content, limiting to the file size from header
+			limitedReader := io.LimitReader(tarReader, header.Size)
+			content, err := io.ReadAll(limitedReader)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("unable to read file %s in tar: %v", header.Name, err)})
+				return
+			}
+
+			csvFiles = append(csvFiles, struct {
+				name    string
+				content []byte
+			}{name: header.Name, content: content})
+		}
+	} else {
+		// Handle ZIP archive (default)
+		zipReader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to open file in zip"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to create zip reader"})
 			return
 		}
 
-		if !strings.HasSuffix(strings.ToLower(file.Name), ".csv") {
-			rc.Close()
-			continue
-		}
+		for _, file := range zipReader.File {
+			// Skip macOS resource fork files
+			fileName := filepath.Base(file.Name)
+			if strings.HasPrefix(fileName, "._") {
+				continue
+			}
 
-		csvReader := csv.NewReader(rc)
+			if !strings.HasSuffix(strings.ToLower(file.Name), ".csv") {
+				continue
+			}
+
+			rc, err := file.Open()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to open file in zip"})
+				return
+			}
+
+			content, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to read file in zip"})
+				return
+			}
+
+			csvFiles = append(csvFiles, struct {
+				name    string
+				content []byte
+			}{name: file.Name, content: content})
+		}
+	}
+
+	// Process CSV files
+	for _, csvFile := range csvFiles {
+		csvReader := csv.NewReader(bytes.NewReader(csvFile.content))
 		csvRecords, err := csvReader.ReadAll()
-		rc.Close()
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to read csv file"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("unable to read csv file %s: %v", csvFile.name, err)})
 			return
 		}
 
@@ -164,6 +233,13 @@ func uploadPrices(c *gin.Context) {
 				continue
 			}
 
+			// Validate that name and category are not empty
+			name := strings.TrimSpace(record[1])
+			category := strings.TrimSpace(record[2])
+			if name == "" || category == "" {
+				continue
+			}
+
 			if seenIDs[id] {
 				duplicatesCount++
 				continue
@@ -181,12 +257,12 @@ func uploadPrices(c *gin.Context) {
 			}
 
 			seenIDs[id] = true
-			categories[strings.TrimSpace(record[2])] = true
+			categories[category] = true
 
 			recordsToInsert = append(recordsToInsert, map[string]string{
 				"id":          record[0],
-				"name":        strings.TrimSpace(record[1]),
-				"category":    strings.TrimSpace(record[2]),
+				"name":        name,
+				"category":    category,
 				"price":       record[3],
 				"create_date": strings.TrimSpace(record[4]),
 			})
