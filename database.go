@@ -38,12 +38,11 @@ func connectDB() {
 func initDB() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS prices (
-		id INTEGER NOT NULL,
+		id SERIAL PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		category VARCHAR(255) NOT NULL,
 		price DECIMAL(10, 2) NOT NULL,
-		create_date DATE NOT NULL,
-		PRIMARY KEY (id)
+		create_date TIMESTAMP NOT NULL
 	);
 	`
 	_, err := db.Exec(context.Background(), query)
@@ -53,4 +52,3 @@ func initDB() error {
 func closeDB() {
 	db.Close(context.Background())
 }
-
