@@ -17,6 +17,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type priceRecord struct {
+	name       string
+	category   string
+	price      float64
+	createDate time.Time
+}
+
 func uploadPrices(c *gin.Context) {
 	archiveType := c.Query("type")
 	if archiveType == "" {
@@ -42,18 +49,13 @@ func uploadPrices(c *gin.Context) {
 		return
 	}
 
-	totalCount := 0
-	duplicatesCount := 0
-	seenIDs := make(map[int]bool)
-	categories := make(map[string]bool)
-
-	var recordsToInsert []map[string]string
 	csvFiles := extractCSVFiles(data, archiveType)
 	if csvFiles == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to read archive"})
 		return
 	}
 
+	var validRecords []priceRecord
 	for _, csvFile := range csvFiles {
 		csvReader := csv.NewReader(bytes.NewReader(csvFile.content))
 		csvRecords, err := csvReader.ReadAll()
@@ -75,10 +77,9 @@ func uploadPrices(c *gin.Context) {
 				continue
 			}
 
-			totalCount++
-
-			id, err := strconv.Atoi(strings.TrimSpace(record[0]))
-			if err != nil {
+			name := strings.TrimSpace(record[1])
+			category := strings.TrimSpace(record[2])
+			if name == "" || category == "" {
 				continue
 			}
 
@@ -87,72 +88,70 @@ func uploadPrices(c *gin.Context) {
 				continue
 			}
 
-			_, err = time.Parse("2006-01-02", strings.TrimSpace(record[4]))
+			createDate, err := time.Parse("2006-01-02", strings.TrimSpace(record[4]))
 			if err != nil {
 				continue
 			}
 
-			name := strings.TrimSpace(record[1])
-			category := strings.TrimSpace(record[2])
-			if name == "" || category == "" {
-				continue
-			}
-
-			if seenIDs[id] {
-				duplicatesCount++
-				continue
-			}
-
-			var exists bool
-			err = db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM prices WHERE id = $1)", id).Scan(&exists)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
-				return
-			}
-			if exists {
-				duplicatesCount++
-				continue
-			}
-
-			seenIDs[id] = true
-			categories[category] = true
-
-			recordsToInsert = append(recordsToInsert, map[string]string{
-				"id":          record[0],
-				"name":        name,
-				"category":    category,
-				"price":       record[3],
-				"create_date": strings.TrimSpace(record[4]),
+			validRecords = append(validRecords, priceRecord{
+				name:       name,
+				category:   category,
+				price:      price,
+				createDate: createDate,
 			})
 		}
 	}
 
-	for _, record := range recordsToInsert {
-		id, _ := strconv.Atoi(record["id"])
-		price, _ := strconv.ParseFloat(record["price"], 64)
-		_, err := db.Exec(context.Background(),
-			"INSERT INTO prices (id, name, category, price, create_date) VALUES ($1, $2, $3, $4, $5)",
-			id, record["name"], record["category"], price, record["create_date"])
-		if err != nil {
-			duplicatesCount++
-		}
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start transaction"})
+		return
 	}
+	defer tx.Rollback(context.Background())
 
-	var totalItems int
-	var totalCategories int
+	duplicatesCount := 0
+	insertedCount := 0
+	categories := make(map[string]bool)
 	var totalPrice float64
 
-	err = db.QueryRow(context.Background(), "SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price), 0) FROM prices").Scan(&totalItems, &totalCategories, &totalPrice)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to calculate statistics"})
+	for _, rec := range validRecords {
+		var exists bool
+		err = tx.QueryRow(context.Background(),
+			"SELECT EXISTS(SELECT 1 FROM prices WHERE name = $1 AND category = $2 AND price = $3 AND create_date = $4)",
+			rec.name, rec.category, rec.price, rec.createDate).Scan(&exists)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+			return
+		}
+
+		if exists {
+			duplicatesCount++
+			continue
+		}
+
+		_, err = tx.Exec(context.Background(),
+			"INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)",
+			rec.name, rec.category, rec.price, rec.createDate)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to insert record"})
+			return
+		}
+
+		insertedCount++
+		categories[rec.category] = true
+		totalPrice += rec.price
+	}
+
+	if err = tx.Commit(context.Background()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit transaction"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"total_count":      totalCount,
+		"total_count":      len(validRecords),
 		"duplicates_count": duplicatesCount,
-		"total_items":      totalItems,
-		"total_categories": totalCategories,
+		"total_items":      insertedCount,
+		"total_categories": len(categories),
 		"total_price":      totalPrice,
 	})
 }
@@ -198,29 +197,42 @@ func getPrices(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database query failed"})
 		return
 	}
-	defer rows.Close()
 
-	var csvData [][]string
-	csvData = append(csvData, []string{"id", "name", "category", "price", "create_date"})
+	type priceRow struct {
+		id         int
+		name       string
+		category   string
+		price      float64
+		createDate time.Time
+	}
 
+	var priceRows []priceRow
 	for rows.Next() {
-		var id int
-		var name, category string
-		var price float64
-		var createDate time.Time
-
-		err := rows.Scan(&id, &name, &category, &price, &createDate)
+		var row priceRow
+		err := rows.Scan(&row.id, &row.name, &row.category, &row.price, &row.createDate)
 		if err != nil {
+			rows.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan row"})
 			return
 		}
+		priceRows = append(priceRows, row)
+	}
+	rows.Close()
 
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "error reading rows"})
+		return
+	}
+
+	var csvData [][]string
+	csvData = append(csvData, []string{"id", "name", "category", "price", "create_date"})
+	for _, row := range priceRows {
 		csvData = append(csvData, []string{
-			strconv.Itoa(id),
-			name,
-			category,
-			strconv.FormatFloat(price, 'f', 2, 64),
-			createDate.Format("2006-01-02"),
+			strconv.Itoa(row.id),
+			row.name,
+			row.category,
+			strconv.FormatFloat(row.price, 'f', 2, 64),
+			row.createDate.Format("2006-01-02"),
 		})
 	}
 
@@ -323,4 +335,3 @@ func extractCSVFiles(data []byte, archiveType string) []csvFileData {
 
 	return csvFiles
 }
-
